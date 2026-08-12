@@ -22,7 +22,7 @@
   * [Discovering a proactor](#discovering-a-proactor)
     * [Overriding the default proactor](#overriding-the-default-proactor)
   * [Solving submission races](#solving-submission-races)
-  * [Fusing the proactor and the executor](#fusing-the-proactor-and-the-executor)
+  * [Combining the proactor and the executor](#combining-the-proactor-and-the-executor)
   * [High-level types](#high-level-types)
   * [Clocks and deadlines](#clocks-and-deadlines)
 * [Future directions](#future-directions)
@@ -88,7 +88,7 @@ threads. A single synchronous file read backed by a slow networked filesystem,
 reached transitively from an async request handler, is enough to spike a
 service's latency or stall a daemon. A complete I/O story therefore has to do
 two things:
-- Make the asynchronous interfaces the natural one.
+- Make the asynchronous interfaces the natural ones.
 - Make it hard to accidentally block a concurrency thread with the synchronous
   one.
 
@@ -105,7 +105,7 @@ The vision sets out goals that shape the concrete solutions:
   diagnostic, rather than a latent production failure.
 * **I/O can run on the executor.** The executor that schedules a task's jobs can
   also wait for that task's I/O, which allows for maximum performance where the
-  two are fused.
+  two are combined.
 * **One model, every platform.** The programming model is identical on every
   platform, even where the implementation is entirely different, for example an
   `io_uring` submission ring versus a thread pool draining blocking syscalls.
@@ -147,7 +147,7 @@ methods, and they trade off reliability against cost:
   the new effect to be propagated through closures, generics and protocols.
 * **A runtime trap:** The blocking operations detect at runtime that they are
   running in an asynchronous context and trap. This needs no language changes,
-  works today, and catches the real misuse no matter how deep it is buried. The
+  and catches the real misuse no matter how deep it is buried. The
   cost is that it adds a small check per call.
 * **Linting:** A separate tool flags synchronous I/O reachable from async code.
   It is better than nothing, but it is not part of the compiler, it is opt-in,
@@ -393,14 +393,14 @@ Intuitively one wants to fold the proactor into the executor, so the object that
 runs a task's jobs also waits for its I/O, resulting in no extra threads, no
 hops, no priority inversion. Many executors already own everything a proactor
 needs, whereas a standalone proactor has to duplicate all of that and coordinate
-across a thread boundary for every completion. That makes fusing the two the
-right *default* for maximum performance. But the fusing should be optional, not
-required, because plenty of programs want the two roles apart. A test harness
+across a thread boundary for every completion. That makes combining the two the
+right *default* for maximum performance. But the combination should be optional,
+not required, because plenty of programs want the two roles apart. A test harness
 might swap in an in-memory proactor to make I/O deterministic while its tasks
 keep running on the ordinary executor. A server might route its socket I/O
 through a single shared `io_uring` proactor for batched submission without
 handing that proactor the whole process's scheduling. So this vision proposes to
-treat the proactor and the executor as separate roles that *may* be fused for
+treat the proactor and the executor as separate roles that *may* be combined for
 maximum performance, rather than one thing that is always both.
 
 The next sections introduce the different pieces to produce the overall story
@@ -542,11 +542,21 @@ How a resource finds the proactor that will service it is a scoped choice.
 Proactors form a stack of preferences pushed for a dynamic scope, much like a
 task executor preference, so different parts of a program can run their I/O on
 different proactors, e.g. one task on an `epoll` proactor and another on
-`io_uring`, independently of which executor either runs on. An operation resolves
-its proactor by walking, in order: the pushed proactor stack from the innermost
-scope outward, taking the first that supports its resource, then the current
-executor, first the active serial executor, then the task executor preference,
-when it is itself a proactor for the resource, and finally the default proactor.
+`io_uring`, independently of which executor either runs on. They are
+*preferences* rather than requirements: a pushed proactor that cannot service a
+resource is passed over and resolution continues outward.
+
+An operation resolves its proactor by walking, in order:
+
+1. The pushed proactor stack, from the innermost scope outward, taking the first
+   proactor that services the operation's resource.
+2. The current executor, when it is itself a proactor for that resource, first
+   the active serial executor and then the task executor preference.
+3. The default proactor.
+
+An explicitly pushed proactor therefore always wins over the executor a task
+happens to be running on, so pushing one is enough to redirect a scope's I/O
+without also having to change how its jobs are scheduled.
 
 ```swift
 // `withProactor` pushes a proactor as a preference for the dynamic extent of its body
@@ -692,12 +702,12 @@ try await withContinuation(of: Int.self, throwing: IOError.self) { continuation,
 }
 ```
 
-### Fusing the proactor and the executor
+### Combining the proactor and the executor
 
 Today continuations offer multiple `resume` methods. Each of them puts the value
 into the buffer of the suspended task and then enqueues the task to run on the
 executor again. While this works, it means that every resumption always leads to
-an additional enqueue. For a fused proactor and executor this is unnecessary
+an additional enqueue. For a combined proactor and executor this is unnecessary
 since they would rather donate their current thread to resume the task
 synchronously.
 
@@ -719,7 +729,7 @@ extension Continuation {
 }
 ```
 
-A fused proactor and executor drains completions on its own thread and, because
+A combined proactor and executor drains completions on its own thread and, because
 that thread is an executor thread, resumes each task inline instead of
 enqueuing:
 
@@ -795,6 +805,8 @@ first the callback cancels the scope, and that cancellation reaches whichever
 proactor is servicing each in-flight operation.
 
 ```swift
+// simplified pseudo-code
+
 public func withDeadline<Return>(
   _ instant: ContinuousClock.Instant,
   tolerance: ContinuousClock.Duration? = nil,
@@ -869,7 +881,8 @@ remainder of its enclosing scope and run the resource's cleanup at scope exit,
 without a nested closure:
 
 ```swift
-with var file = try await AsyncFile.open(at: path, options: .read), var connection = try await AsyncTCPConnection.connect(to: address) {
+with var file = try await AsyncFile.open(at: path, options: .read),
+  var connection = try await AsyncTCPConnection.connect(to: address) {
   try await file.pipe(into: &connection)
 }
 ```
@@ -894,7 +907,7 @@ so there is only ever one component and never a hop. We rejected making that the
 that motivate the split: an in-memory proactor swapped in for deterministic
 tests, a single shared `io_uring` proactor serving several executors, or a bare
 I/O service that has no business scheduling arbitrary jobs. The proactor is
-therefore a separate capability that *may* be fused with an executor.
+therefore a separate capability that *may* be combined with an executor.
 
 ### A single data-driven operation type
 
@@ -1003,7 +1016,7 @@ completion" approach taken here.
 Grand Central Dispatch is Apple's prior art for delivering I/O as work items
 onto a queue, using dispatch sources over `kqueue` and `DispatchIO`
 channels. This vision keeps GCD's good idea of eventing delivered onto the
-executor while making fusing optional and preserving the non-blocking
+executor while making that combination optional and preserving the non-blocking
 forward-progress contract GCD lacked.
 
 ### Java

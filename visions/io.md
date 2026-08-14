@@ -16,13 +16,13 @@
 * [Two surfaces with shared primitives](#two-surfaces-with-shared-primitives)
 * [Streaming protocols](#streaming-protocols)
 * [Integration with Swift Concurrency](#integration-with-swift-concurrency)
-  * [The proactor protocol](#the-proactor-protocol)
-  * [Resource-specific proactor protocols](#resource-specific-proactor-protocols)
+  * [The operation scheduler protocol](#the-operation-scheduler-protocol)
+  * [Resource-specific operation scheduler protocols](#resource-specific-operation-scheduler-protocols)
   * [Stable buffer pointers](#stable-buffer-pointers)
-  * [Discovering a proactor](#discovering-a-proactor)
-    * [Overriding the default proactor](#overriding-the-default-proactor)
+  * [Discovering an operation scheduler](#discovering-an-operation-scheduler)
+    * [Overriding the default operation scheduler](#overriding-the-default-operation-scheduler)
   * [Solving submission races](#solving-submission-races)
-  * [Combining the proactor and the executor](#combining-the-proactor-and-the-executor)
+  * [Combining the operation scheduler and the executor](#combining-the-operation-scheduler-and-the-executor)
   * [High-level types](#high-level-types)
   * [Clocks and deadlines](#clocks-and-deadlines)
 * [Future directions](#future-directions)
@@ -35,7 +35,7 @@
   * [A single data-driven operation type](#a-single-data-driven-operation-type)
   * [One resource type with both sync and async methods](#one-resource-type-with-both-sync-and-async-methods)
   * [Unadorned names for the synchronous surface](#unadorned-names-for-the-synchronous-surface)
-  * [Asynchronous proactor methods](#asynchronous-proactor-methods)
+  * [Asynchronous operation scheduler methods](#asynchronous-operation-scheduler-methods)
 * [Prior art](#prior-art)
   * [Go](#go)
   * [Rust](#rust)
@@ -372,11 +372,12 @@ you hand the system the whole operation and it tells you the result when it is
 done, e.g. `io_uring`, `IOCP`, and overlapped I/O. That component is commonly
 referred to as a **proactor**. Swift Concurrency is already completion-shaped
 through its `async/await` and continuation model. A task submits work, suspends,
-and is resumed with a result, making a proactor the natural fit. Readiness
-mechanisms are easily respelled into a proactor API, by turning "read these
-bytes" into "wait until readable, then read." Mapping readiness onto completion
-is cheap whereas going the other way would give up the syscall batching a
-completion interface allows.
+and is resumed with a result, making the completion model the natural fit. This
+vision proposes to call the component that services I/O in that model an **operation
+scheduler**. Readiness mechanisms are easily respelled into an operation
+scheduler's API, by turning "read these bytes" into "wait until readable, then
+read." Mapping readiness onto completion is cheap whereas going the other way
+would give up the syscall batching a completion interface allows.
 
 The two shapes differ in who owns the buffer while the task is suspended, which
 in turn shapes how cancellation works. On a readiness backend the syscall has
@@ -384,44 +385,44 @@ not run yet, so no buffer is shared with the kernel. Cancelling can resume the
 waiting continuation immediately and simply drop the interest. On a completion
 backend the kernel may be reading into or writing from the caller's buffer for
 as long as the task is suspended, so the operation cannot just be abandoned. The
-proactor has to submit a real kernel cancellation and keep the buffer alive
+operation scheduler has to submit a real kernel cancellation and keep the buffer alive
 until the kernel confirms the operation completed or was cancelled. Some
 backends cannot cancel an in-flight operation at all, so they just have to wait
 until the operation completes.
 
-Intuitively one wants to fold the proactor into the executor, so the object that
+Intuitively one wants to fold the operation scheduler into the executor, so the object that
 runs a task's jobs also waits for its I/O, resulting in no extra threads, no
-hops, no priority inversion. Many executors already own everything a proactor
-needs, whereas a standalone proactor has to duplicate all of that and coordinate
+hops, no priority inversion. Many executors already own everything an operation scheduler
+needs, whereas a standalone operation scheduler has to duplicate all of that and coordinate
 across a thread boundary for every completion. That makes combining the two the
 right *default* for maximum performance. But the combination should be optional,
 not required, because plenty of programs want the two roles apart. A test harness
-might swap in an in-memory proactor to make I/O deterministic while its tasks
+might swap in an in-memory operation scheduler to make I/O deterministic while its tasks
 keep running on the ordinary executor. A server might route its socket I/O
-through a single shared `io_uring` proactor for batched submission without
-handing that proactor the whole process's scheduling. So this vision proposes to
-treat the proactor and the executor as separate roles that *may* be combined for
+through a single shared `io_uring` operation scheduler for batched submission without
+handing that operation scheduler the whole process's scheduling. So this vision proposes to
+treat the operation scheduler and the executor as separate roles that *may* be combined for
 maximum performance, rather than one thing that is always both.
 
 The next sections introduce the different pieces to produce the overall story
 for asynchronous I/O in Swift Concurrency.
 
-### The proactor protocol
+### The operation scheduler protocol
 
-A proactor owns the *identity and control* of in-flight operations. It is
+An operation scheduler owns the *identity and control* of in-flight operations. It is
 deliberately *not* an executor and never runs jobs, since that's the executor's
-role. Every operation a proactor services shares one common lifecycle:
+role. Every operation an operation scheduler services shares one common lifecycle:
 
 > **Submit, then complete or cancel, then deliver a typed result**, with
 > priority carried throughout.
 
 Cancelling an operation and escalating its priority apply to every operation
 regardless of what it reads or writes, so they form a small, resource-agnostic
-baseline: given a value that identifies one in-flight operation, a proactor can
+baseline: given a value that identifies one in-flight operation, an operation scheduler can
 make a best-effort attempt to cancel it or raise its priority.
 
 ```swift
-public protocol Proactor: AnyObject {
+public protocol OperationScheduler: AnyObject {
   func cancel(_ registration: OperationRegistration)
   func escalatePriority(
     of registration: OperationRegistration,
@@ -435,19 +436,19 @@ public struct OperationRegistration: Sendable, Hashable {
 }
 ```
 
-### Resource-specific proactor protocols
+### Resource-specific operation scheduler protocols
 
 A resource family such as files, sockets, clocks, or processes is a protocol that
-*refines* `Proactor` and adds that family's operations as concretely-typed
+*refines* `OperationScheduler` and adds that family's operations as concretely-typed
 `submit` methods. Each takes a `Continuation` carrying that operation's result
 and error type, and returns an `OperationRegistration` synchronously so the
-caller can wire up cancellation and escalation. Refining `Proactor` per resource
+caller can wire up cancellation and escalation. Refining `OperationScheduler` per resource
 makes this model extensible, as packages or platforms can define their own
-resource-specific proactor protocol that concrete proactor implementations can
-conform to.
+resource-specific operation scheduler protocol that concrete operation schedulers
+can conform to.
 
 ```swift
-public protocol FileProactor: Proactor {
+public protocol FileOperationScheduler: OperationScheduler {
   func submitOpen(
     _ continuation: consuming Continuation<PlatformHandle, IOError>,
     at path: FilePath,
@@ -464,17 +465,17 @@ public protocol FileProactor: Proactor {
 }
 ```
 
-The standard library is expected to ship resource-specific proactor protocols
-for the common resources: a `FileProactor`, socket and listener proactors, a
-pipe proactor, a clock proactor, and a process proactor, each refining
-`Proactor` with that family's `submit` methods. Because a resource family is
-just a protocol refining `Proactor`, a package or a platform can add a new kind
-of I/O by defining its own refinement and vending a proactor that conforms to
+The standard library is expected to ship resource-specific operation scheduler protocols
+for the common resources: a `FileOperationScheduler`, socket and listener operation schedulers, a
+pipe operation scheduler, a clock operation scheduler, and a process operation scheduler, each refining
+`OperationScheduler` with that family's `submit` methods. Because a resource family is
+just a protocol refining `OperationScheduler`, a package or a platform can add a new kind
+of I/O by defining its own refinement and vending an operation scheduler that conforms to
 it, without any change to the core primitives:
 
 ```swift
 // A package that drives a bespoke device defines its own resource protocol.
-public protocol CustomDeviceProactor: Proactor {
+public protocol CustomDeviceOperationScheduler: OperationScheduler {
   func submitDeviceRead(
     _ continuation: consuming Continuation<Int, IOError>,
     device: CustomDevice,
@@ -486,7 +487,7 @@ public protocol CustomDeviceProactor: Proactor {
 ### Stable buffer pointers
 
 As noted above, in a completion-based backend, when a read or write is submitted,
-the proactor hands the kernel a pointer into the caller's buffer, and the kernel
+the operation scheduler hands the kernel a pointer into the caller's buffer, and the kernel
 writes into that buffer directly at some point between submission and
 completion, while the task is suspended. The pointer has to stay valid, and the
 storage behind it has to stay in place, for the whole in-flight window rather
@@ -495,7 +496,7 @@ than only for the duration of the `submitRead` call.
 The `OutputRawSpan` the caller passes owns that storage. The high-level type
 borrows it `inout` for the entire `async` operation, so the borrow spans the
 suspension and nothing else can move, mutate, or free the storage while the
-operation is in flight. The proactor projects a stable pointer out of the span at
+operation is in flight. The operation scheduler projects a stable pointer out of the span at
 submission and holds it until it resumes the continuation:
 
 ```swift
@@ -518,84 +519,84 @@ The high-level `read` is what keeps that pointer valid. Its `buffer` parameter
 is `inout`, so the borrow of the caller's storage lasts for the whole `async`
 call, and it hands that same `buffer` to `submitRead` before suspending in
 `awaiter.wait()`. Because the borrow outlives the suspension, the storage the
-proactor's pointer refers to cannot move or be freed until the continuation
+operation scheduler's pointer refers to cannot move or be freed until the continuation
 resumes and `read` returns:
 
 ```swift
 mutating func read(into buffer: inout OutputRawSpan) async throws(IOError) -> Int {
   try await withContinuation(of: Int.self, throwing: IOError.self) { continuation, awaiter in
-    // `buffer` is borrowed for the whole call, so the stable pointer the proactor
+    // `buffer` is borrowed for the whole call, so the stable pointer the operation scheduler
     // takes here stays valid until the await below resumes.
-    let registration = proactor.submitRead(continuation, handle: handle, into: &buffer)
+    let registration = operationScheduler.submitRead(continuation, handle: handle, into: &buffer)
     return try await withTaskCancellationHandler {
       try await awaiter.wait()
     } onCancel: {
-      proactor.cancel(registration)
+      operationScheduler.cancel(registration)
     }
   }
 }
 ```
 
-### Discovering a proactor
+### Discovering an operation scheduler
 
-How a resource finds the proactor that will service it is a scoped choice.
-Proactors form a stack of preferences pushed for a dynamic scope, much like a
+How a resource finds the operation scheduler that will service it is a scoped choice.
+Operation schedulers form a stack of preferences pushed for a dynamic scope, much like a
 task executor preference, so different parts of a program can run their I/O on
-different proactors, e.g. one task on an `epoll` proactor and another on
+different operation schedulers, e.g. one task on an `epoll` operation scheduler and another on
 `io_uring`, independently of which executor either runs on. They are
-*preferences* rather than requirements: a pushed proactor that cannot service a
+*preferences* rather than requirements: a pushed operation scheduler that cannot service a
 resource is passed over and resolution continues outward.
 
-An operation resolves its proactor by walking, in order:
+An operation resolves its operation scheduler by walking, in order:
 
-1. The pushed proactor stack, from the innermost scope outward, taking the first
-   proactor that services the operation's resource.
-2. The current executor, when it is itself a proactor for that resource, first
+1. The pushed operation scheduler stack, from the innermost scope outward, taking the first
+   operation scheduler that services the operation's resource.
+2. The current executor, when it is itself an operation scheduler for that resource, first
    the active serial executor and then the task executor preference.
-3. The default proactor.
+3. The default operation scheduler.
 
-An explicitly pushed proactor therefore always wins over the executor a task
+An explicitly pushed operation scheduler therefore always wins over the executor a task
 happens to be running on, so pushing one is enough to redirect a scope's I/O
 without also having to change how its jobs are scheduled.
 
 ```swift
-// `withProactor` pushes a proactor as a preference for the dynamic extent of its body
-try await withProactor(IOUringProactor()) {
+// `withOperationScheduler` pushes an operation scheduler as a preference for the dynamic extent of its body
+try await withOperationScheduler(IOUringOperationScheduler()) {
   // Operations here use io_uring for the resources it supports.
-  try await withProactor(EpollProactor()) {
+  try await withOperationScheduler(EpollOperationScheduler()) {
     // Here epoll is used. A resource that epoll cannot service falls back
-    // outward to io_uring, and finally to the default proactor.
+    // outward to io_uring, and finally to the default operation scheduler.
   }
 }
 ```
 
-A resource resolves its proactor once, at creation, and stores it to ensure all
-later operations are submitted to the same proactor it was created on.
+A resource resolves its operation scheduler once, at creation, and stores it to ensure all
+later operations are submitted to the same operation scheduler it was created on.
 
 ```swift
 public struct AsyncFile: ~Copyable, Sendable {
   let handle: PlatformHandle
   // Resolved once at `open` and stored
-  let proactor: any FileProactor
+  let operationScheduler: any FileOperationScheduler
 
   static func open<R: ~Copyable>(
     at path: FilePath,
     options: OpenOptions,
     _ body: (inout AsyncFile) async throws -> R
   ) async throws -> R {
-    // Discover the FileProactor from the enclosing scope exactly once.
-    let proactor = Task.currentProactor(conformingTo: FileProactor.self)
+    // Discover the FileOperationScheduler from the enclosing scope exactly once.
+    let operationScheduler = Task.currentOperationScheduler(conformingTo: FileOperationScheduler.self)
 
     let handle = try await withContinuation(of: PlatformHandle.self, throwing: IOError.self) { continuation, awaiter in
-      let registration = proactor.submitOpen(continuation, at: path, options: options)
+      let registration = operationScheduler.submitOpen(continuation, at: path, options: options)
       return try await withTaskCancellationHandler {
         try await awaiter.wait()
       } onCancel: {
-        proactor.cancel(registration)
+        operationScheduler.cancel(registration)
       }
     }
 
-    var file = AsyncFile(handle: handle, proactor: proactor)
+    var file = AsyncFile(handle: handle, operationScheduler: operationScheduler)
 
     defer {
       try? await withTaskCancellationShield { try await file.close() }
@@ -604,42 +605,42 @@ public struct AsyncFile: ~Copyable, Sendable {
     return try await body(&file)
   }
 
-  // A later write submits to the same stored proactor
+  // A later write submits to the same stored operation scheduler
   mutating func write(from buffer: inout InputRawSpan) async throws(IOError) -> Int {
     try await withContinuation(of: Int.self, throwing: IOError.self) { continuation, awaiter in
-      let registration = proactor.submitWrite(continuation, handle: handle, from: &buffer)
+      let registration = operationScheduler.submitWrite(continuation, handle: handle, from: &buffer)
       return try await withTaskCancellationHandler {
         try await awaiter.wait()
       } onCancel: {
-        proactor.cancel(registration)
+        operationScheduler.cancel(registration)
       }
     }
   }
 }
 ```
 
-#### Overriding the default proactor
+#### Overriding the default operation scheduler
 
-Scoped preferences pick a proactor for part of a program. However, a program can
+Scoped preferences pick an operation scheduler for part of a program. However, a program can
 also replace the process-wide default. Defaults are installed before any task
 runs by pointing a typealias at a factory:
 
 ```swift
-struct MyProactorFactory: ProactorFactory {
-  // Vends a proactor conforming to the resource-specific protocols it can service.
-  static var defaultProactor: some Proactor { IOUringProactor() }
+struct MyOperationSchedulerFactory: OperationSchedulerFactory {
+  // Vends an operation scheduler conforming to the resource-specific protocols it can service.
+  static var defaultOperationScheduler: some OperationScheduler { IOUringOperationScheduler() }
 }
 
-typealias DefaultProactorFactory = MyProactorFactory
+typealias DefaultOperationSchedulerFactory = MyOperationSchedulerFactory
 ```
 
-Replacing the default proactor means taking responsibility for the resources it
+Replacing the default operation scheduler means taking responsibility for the resources it
 must service: if it does not support a resource some dependency reaches, and
 nothing else in scope does either, that operation traps.
 
 ### Solving submission races
 
-The resource-specific proactor protocols take continuations that they resume
+The resource-specific operation scheduler protocols take continuations that they resume
 once an operation completes. Today continuations in Swift are created using
 `await withContinuation { ... }` which couples the creation and awaiting of the
 continuation in one method. The closure for the `withContinuation` method is
@@ -654,7 +655,7 @@ created.
 // await from the outside, where the registration is not yet in scope.
 try await withTaskCancellationHandler {
   try await withCheckedContinuation { continuation in
-    let registration = proactor.submitRead(continuation, handle: handle, into: &buffer)
+    let registration = operationScheduler.submitRead(continuation, handle: handle, into: &buffer)
     // `registration` cannot escape this closure.
   }
 } onCancel: {
@@ -670,7 +671,7 @@ of the continuation, which resolves the races above.
 
 ```swift
 // The split primitive hands the body two halves: a `Continuation` resume half to
-// give to the proactor, and a `ContinuationAwaiter` the task keeps and awaits.
+// give to the operation scheduler, and a `ContinuationAwaiter` the task keeps and awaits.
 public nonisolated(nonsending) func withContinuation<Success: ~Copyable, Failure: Error>(
   of: Success.Type = Success.self,
   throwing: Failure.Type,
@@ -687,27 +688,27 @@ the await:
 
 ```swift
 try await withContinuation(of: Int.self, throwing: IOError.self) { continuation, awaiter in
-  // The continuation is handed to the proactor before the task suspends.
-  let registration = proactor.submitRead(continuation, handle: handle, into: &buffer)
+  // The continuation is handed to the operation scheduler before the task suspends.
+  let registration = operationScheduler.submitRead(continuation, handle: handle, into: &buffer)
 
   return try await withTaskPriorityEscalationHandler {
     try await withTaskCancellationHandler {
       try await awaiter.wait()
     } onCancel: {
-      proactor.cancel(registration)
+      operationScheduler.cancel(registration)
     }
   } onPriorityEscalated: { _, newPriority in
-    proactor.escalatePriority(of: registration, to: newPriority)
+    operationScheduler.escalatePriority(of: registration, to: newPriority)
   }
 }
 ```
 
-### Combining the proactor and the executor
+### Combining the operation scheduler and the executor
 
 Today continuations offer multiple `resume` methods. Each of them puts the value
 into the buffer of the suspended task and then enqueues the task to run on the
 executor again. While this works, it means that every resumption always leads to
-an additional enqueue. For a combined proactor and executor this is unnecessary
+an additional enqueue. For a combined operation scheduler and executor this is unnecessary
 since they would rather donate their current thread to resume the task
 synchronously.
 
@@ -729,13 +730,13 @@ extension Continuation {
 }
 ```
 
-A combined proactor and executor drains completions on its own thread and, because
+A combined operation scheduler and executor drains completions on its own thread and, because
 that thread is an executor thread, resumes each task inline instead of
 enqueuing:
 
 ```swift
 while running {
-  for (continuation, result) in proactor.drainCompletedOperations() {
+  for (continuation, result) in operationScheduler.drainCompletedOperations() {
     continuation.resumeSynchronously(
       isolatedTo: self.asUnownedSerialExecutor(),
       taskExecutor: self.asUnownedTaskExecutor(),
@@ -745,12 +746,12 @@ while running {
 }
 ```
 
-A standalone proactor, whose thread is not an executor thread, calls the
+A standalone operation scheduler, whose thread is not an executor thread, calls the
 ordinary `resume(with:)` and takes the one hop back onto the task's executor.
 
 ### High-level types
 
-Application and library authors are not expected to touch proactors or
+Application and library authors are not expected to touch operation schedulers or
 continuations directly. As the `AsyncFile` above shows, each resource gets an
 ergonomic high-level type, a `TCPConnection`, a `UDPSocket`, and so on, that
 hides the discovery, storage, and continuation-and-handler dance behind ordinary
@@ -767,12 +768,12 @@ extension AsyncTCPConnection: AsyncReader, AsyncWriter {}
 
 ### Clocks and deadlines
 
-Not every resource is handle-backed. A clock is the smallest proactor: it
+Not every resource is handle-backed. A clock is the smallest operation scheduler: it
 services a single `sleep`, and because a sleep has no handle to store, it
-resolves its proactor per call through the same discovery chain.
+resolves its operation scheduler per call through the same discovery chain.
 
 ```swift
-public protocol ContinuousClockProactor: Proactor {
+public protocol ContinuousClockOperationScheduler: OperationScheduler {
   func submitSleep(
     _ continuation: consuming Continuation<Void, CancellationError>,
     until instant: ContinuousClock.Instant,
@@ -783,11 +784,11 @@ public protocol ContinuousClockProactor: Proactor {
 
 Clocks are not only used for sleeps but also for deadlines. A deadline is a
 point in time where a certain scope needs to be cancelled. This can be
-implemented by a clock proactor with a fire callback at that instant, and when
+implemented by a clock operation scheduler with a fire callback at that instant, and when
 the callback fires it cancels the scope.
 
 ```swift
-public protocol ContinuousClockProactor: Proactor {
+public protocol ContinuousClockOperationScheduler: OperationScheduler {
   ...
   // A callback variant runs a bare callback at the instant.
   func submitSleep(
@@ -802,7 +803,7 @@ public protocol ContinuousClockProactor: Proactor {
 schedules a bare callback for the instant that cancels that scope, and runs the
 body. If the body finishes first the timer is dropped. If the instant is reached
 first the callback cancels the scope, and that cancellation reaches whichever
-proactor is servicing each in-flight operation.
+operation scheduler is servicing each in-flight operation.
 
 ```swift
 // simplified pseudo-code
@@ -812,17 +813,17 @@ public func withDeadline<Return>(
   tolerance: ContinuousClock.Duration? = nil,
   _ body: () async throws -> Return
 ) async throws -> Return {
-  let proactor = Task.currentProactor(conformingTo: ContinuousClockProactor.self)
+  let operationScheduler = Task.currentOperationScheduler(conformingTo: ContinuousClockOperationScheduler.self)
   return try await withCancellationScope { scope in
     // A bare callback that cancels the scope when the instant is reached. No task
     // is parked on the timer.
-    let registration = proactor.submitSleep(
+    let registration = operationScheduler.submitSleep(
       { scope.cancel() },
       until: instant,
       tolerance: tolerance
     )
     // Drop the timer if the body finishes before the instant is reached.
-    defer { proactor.cancel(registration) }
+    defer { operationScheduler.cancel(registration) }
     return try await body()
   }
 }
@@ -891,11 +892,11 @@ with var file = try await AsyncFile.open(at: path, options: .read),
 
 ### Static resource capability via an effects system
 
-An operation discovers its proactor at runtime and traps if nothing in scope
+An operation discovers its operation scheduler at runtime and traps if nothing in scope
 supports the resource. If the language ever gained an effects system, then this
-could instead model "requires a `FileProactor` in scope" as an effect carried in
+could instead model "requires a `FileOperationScheduler` in scope" as an effect carried in
 a function's signature, turning that runtime trap into a static guarantee. This
-would not only solve the proactor discovery but also solve the problem
+would not only solve the operation scheduler discovery but also solve the problem
 ["prohibiting synchronous I/O in asynchronous
 contexts"](#prohibiting-synchronous-io-in-asynchronous-contexts).
 
@@ -904,9 +905,9 @@ contexts"](#prohibiting-synchronous-io-in-asynchronous-contexts).
 The most direct design makes the executor itself the thing that waits for I/O,
 so there is only ever one component and never a hop. We rejected making that the
 *only* model. Welding eventing to the executor forecloses the configurations
-that motivate the split: an in-memory proactor swapped in for deterministic
-tests, a single shared `io_uring` proactor serving several executors, or a bare
-I/O service that has no business scheduling arbitrary jobs. The proactor is
+that motivate the split: an in-memory operation scheduler swapped in for deterministic
+tests, a single shared `io_uring` operation scheduler serving several executors, or a bare
+I/O service that has no business scheduling arbitrary jobs. The operation scheduler is
 therefore a separate capability that *may* be combined with an executor.
 
 ### A single data-driven operation type
@@ -924,8 +925,8 @@ implements.
 
 Rather than separate `File` and `AsyncFile`, a single type could carry both
 surfaces and pick per call. We rejected it since an asynchronous resource has to
-hold the proactor it was pinned to at creation while a synchronous one holds
-nothing, so a unified type would carry an optional proactor and an ill-defined
+hold the operation scheduler it was pinned to at creation while a synchronous one holds
+nothing, so a unified type would carry an optional operation scheduler and an ill-defined
 answer for what a synchronous read does on an asynchronously-opened handle.
 Separate types give each exactly the state it needs.
 
@@ -938,11 +939,11 @@ follow the precedent already set by `Sequence` and `AsyncSequence`, where it is
 the asynchronous variant that carries the `Async` prefix. Matching that
 convention keeps the surfaces predictable across the standard library.
 
-### Asynchronous proactor methods
+### Asynchronous operation scheduler methods
 
-The proactor's `submit` methods could themselves be `async` and simply return
+The operation scheduler's `submit` methods could themselves be `async` and simply return
 the result. We kept them continuation-taking and synchronous instead to avoid
-having each proactor implement the continuation, cancellation and priority
+having each operation scheduler implement the continuation, cancellation and priority
 escalation setup. More importantly, it makes further optimizations possible,
 such as a child-task-free `select` and fused linked operations.
 

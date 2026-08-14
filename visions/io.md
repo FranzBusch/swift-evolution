@@ -373,11 +373,11 @@ done, e.g. `io_uring`, `IOCP`, and overlapped I/O. That component is commonly
 referred to as a **proactor**. Swift Concurrency is already completion-shaped
 through its `async/await` and continuation model. A task submits work, suspends,
 and is resumed with a result, making the completion model the natural fit. This
-vision proposes to call the component that services I/O in that model an **operation
-scheduler**. Readiness mechanisms are easily respelled into an operation
-scheduler's API, by turning "read these bytes" into "wait until readable, then
-read." Mapping readiness onto completion is cheap whereas going the other way
-would give up the syscall batching a completion interface allows.
+vision proposes to call the component that services I/O in that model an
+**operation scheduler**. Readiness mechanisms are easily respelled into an
+operation scheduler's API, by turning "read these bytes" into "wait until
+readable, then read." Mapping readiness onto completion is cheap whereas going
+the other way would give up the syscall batching a completion interface allows.
 
 The two shapes differ in who owns the buffer while the task is suspended, which
 in turn shapes how cancellation works. On a readiness backend the syscall has
@@ -432,7 +432,7 @@ public protocol OperationScheduler: AnyObject {
 
 // An opaque, stable, non-reused identity for one in-flight operation.
 public struct OperationRegistration: Sendable, Hashable {
-  public var id: UInt64
+  public var id: UInt
 }
 ```
 

@@ -26,6 +26,7 @@
   * [High-level types](#high-level-types)
   * [Clocks and deadlines](#clocks-and-deadlines)
 * [Future directions](#future-directions)
+  * [A one-shot coroutine for the stream-owned forms](#a-one-shot-coroutine-for-the-stream-owned-forms)
   * [A linked-operation DSL](#a-linked-operation-dsl)
   * [Child-task-free multi-await](#child-task-free-multi-await)
   * [A `with` statement for scoped resources](#a-with-statement-for-scoped-resources)
@@ -96,13 +97,12 @@ two things:
 
 The vision sets out goals that shape the concrete solutions:
 
-* **Synchronous and asynchronous I/O, one set of types.** Both surfaces are
-  first-class. They share the same currency types, the platform handles,
-  buffers, socket addresses, open options, and errors, and differ only by the
-  `await`.
+* **Synchronous and asynchronous I/O with shared currency types.** Both surfaces
+  are first-class. They share the same currency types, the platform handles,
+  buffers, socket addresses, open options, and errors.
 * **Hard to block a concurrency thread by accident.** Reaching a
   potentially-blocking synchronous operation from an `async` context should be a
-  diagnostic, rather than a latent production failure.
+  diagnostic or runtime trap, rather than a latent production failure.
 * **I/O can run on the executor.** The executor that schedules a task's jobs can
   also wait for that task's I/O, which allows for maximum performance where the
   two are combined.
@@ -111,12 +111,12 @@ The vision sets out goals that shape the concrete solutions:
   `io_uring` submission ring versus a thread pool draining blocking syscalls.
 * **Progressive disclosure by audience.** Application and library authors use
   high level currency types and compose on a small set of streaming protocols.
-  Only runtime and backend authors implement executors and operations.
+  Only runtime and backend authors implement executors and operation schedulers.
 * **Integrated cancellation and priority.** Cancelling a task cancels the
   *actual* in-flight operation and releases its resources, and escalating a
-  task's priority re-prioritises its pending I/O. The model carries the
-  cancellation and the priority all the way through to the operation rather than
-  stopping at the suspension.
+  task's priority re-prioritises its pending I/O. The cancellation and the
+  priority are carried all the way through to the operation rather than stopping
+  at the suspension.
 * **Extensible and executor-agnostic.** New kinds of I/O, or a whole new
   platform, can be added without changing the core primitives.
 
@@ -159,7 +159,22 @@ methods, and they trade off reliability against cost:
 
 While a new function color is the most correct, it has such wide-reaching impact
 on the language that the **runtime trap** is the best answer right now, trading
-off language complexity against a small runtime cost.
+off language complexity against a small runtime cost. The check itself can be
+generated with a new `@blocking` macro that marks an operation that may block
+and rewrites its body to ask the runtime first:
+
+```swift
+@blocking
+public func read(into buffer: inout OutputRawSpan) throws(IOError) -> Int {
+  try self.readSyscall(into: &buffer)
+}
+
+// The macro expands to.
+public func read(into buffer: inout OutputRawSpan) throws(IOError) -> Int {
+  precondition(isBlockingAllowed(), "Blocking call in an asynchronous context")
+  try self.readSyscall(into: &buffer)
+}
+```
 
 The trap fires when a blocking operation actually runs in an asynchronous
 context, so it catches misuse in practice without being a static guarantee.
@@ -175,6 +190,12 @@ withBlockingAllowed {
 }
 ```
 
+The macro's generated preamble is checking if there is a current task and if a
+scoped opt-out is in effect. This is opt-in and nothing infers `@blocking` for
+the callers of a `@blocking` function. In practice the blocking is concentrated
+in a few places. Mostly, the standard library's synchronous surface and
+libraries wrapping C APIs.
+
 ## Two surfaces with shared primitives
 
 Both the synchronous and asynchronous surface are built from one set of types,
@@ -189,7 +210,7 @@ such as:
 - A `SocketAddress` for socket operations
 - An `OpenOptions` for file opening operations
 - An `IOError` that surfaces portable, well-known error cases with the raw
-  platform code available as an escape hatch, plus a `cancelled` case.
+  platform code available as an escape hatch.
 
 On top of the currency types sit the resource types most programs use: files,
 TCP and UDP sockets and listeners, pipes and terminals, and subprocesses. Each
@@ -255,9 +276,20 @@ In the caller-owned forms a reader fills the caller's span and a writer drains
 it. In the stream-owned forms the stream hands the caller a mutating span to
 drain or fill, which unlocks zero-copy paths. They come in synchronous and
 asynchronous forms and they are element-generic. They are intended to evolve
-`AsyncSequence`, keeping its ergonomics while solving some existing issues
-such as the lack of a write-side, bulk-reading, support for `~Copyable` types
-and more.
+`AsyncSequence`, keeping its ergonomics while solving some existing issues such
+as the lack of a write-side, bulk-reading, support for `~Copyable` types and
+more.
+
+The synchronous half of that grid is where the standard library is already
+heading. `Iterable` ([SE-0516][SE-0516]) replaces element-at-a-time iteration
+with bulk iteration over spans of a type's own storage, with a typed `Failure`
+and support for `~Copyable` and `~Escapable` types, and the `Producer` and
+`Drain` protocols prototyped in the future directions alongside it cover filling
+a caller-supplied `OutputSpan` and lending `InputSpan`s of a type's own storage
+for in-place consumption. I/O must not end up with a second vocabulary for it,
+so the synchronous forms should be those protocols, extended with the two
+write-side halves the family does not have yet, and the asynchronous forms
+should be their `Async`-prefixed analogs.
 
 The high-level types simply conform, so copying a file into a socket is a single
 pipe:
@@ -280,18 +312,32 @@ try File.open(at: path, options: .read) { file in
 }
 ```
 
-Sometimes the caller would rather the stream own the buffer. A buffered reader
+Sometimes the caller would rather the stream own the buffer. An async drain
 lends a mutating view of its own bytes, so a chunk is consumed in place with no
-copy into a caller buffer, and a buffered writer lends its buffer to fill
-directly:
+copy into a caller buffer, and its write-side counterpart lends space in its own
+buffer to fill directly. That lending has to be scoped, since the span is only
+valid while the stream keeps its buffer stable, and the stream only learns how
+much was consumed or produced once the caller is done with the span:
 
 ```swift
+// A chunk of the file's own buffer.
+try await file.withNextSpan { (chunk: inout InputSpan<UInt8>) in
+  handle(&chunk)
+}
+
+// Space in the writer's own buffer to encode into directly.
+try await file.intoNextSpan { (out: inout OutputSpan<UInt8>) in
+  encode(message, into: &out)
+}
+```
+
+With loop sugar on top, draining a file reads like iterating any other stream:
+
+```swift
+// pseudo-code
 for mutating try await chunk in reader {
   handle(&chunk) // a mutating view into the reader's own buffer
 }
-
-var out = try await writer.next() // a mutable view into the writer's buffer
-encode(message, into: &out)
 ```
 
 A decoder or decompressor is just a stream wrapping another stream:
@@ -318,38 +364,43 @@ for try await request in requests {
 ```
 
 A rough outline of the asynchronous forms is shown below. The synchronous forms
-mirror them with the `await` removed. They are element-generic to cater to both
-byte-based and arbitrary-element-based use-cases. The caller-owned forms take a
-span the caller owns. The stream-owned forms lend a view of the stream's own
-storage through a one-shot (`yields`) coroutine.
+mirror them with the `Async` and `await` removed. They are element-generic to
+cater to both byte-based and arbitrary-element-based use-cases. The caller-owned
+forms take a span the caller owns. The stream-owned forms lend a span of the
+stream's own storage for the duration of a body, which is why their requirement
+is closure-taking.
 
 ```swift
-// Caller-owned buffer: the caller passes a span for the reader to fill or the
-// writer to drain.
-public protocol AsyncReader<Element, Failure>: ~Copyable, ~Escapable {
+// Caller-owned buffer: the caller passes a span for the producer to fill or the
+// consumer to drain.
+public protocol AsyncProducer<Element, Failure>: ~Copyable, ~Escapable {
   associatedtype Element: ~Copyable
   associatedtype Failure: Error
   mutating func read(into buffer: inout OutputSpan<Element>) async throws(Failure)
 }
 
-public protocol AsyncWriter<Element, Failure>: ~Copyable, ~Escapable {
+public protocol AsyncConsumer<Element, Failure>: ~Copyable, ~Escapable {
   associatedtype Element: ~Copyable
   associatedtype Failure: Error
   mutating func write(from buffer: inout InputSpan<Element>) async throws(Failure)
 }
 
-// Stream-owned buffer: the stream lends a view of its own storage via a one-shot
-// coroutine, so a chunk is consumed or produced in place with no copy.
-public protocol AsyncBufferedReader<Element, Failure>: ~Copyable, ~Escapable {
+// Stream-owned buffer: the stream lends a span of its own storage for the
+// duration of `body`, so a chunk is consumed or produced in place with no copy.
+public protocol AsyncDrain<Element, Failure>: ~Copyable, ~Escapable {
   associatedtype Element: ~Copyable
-  associatedtype Failure: Error
-  mutating func next() async throws(Failure) yields (inout InputSpan<Element>)
+  associatedtype DrainFailure: Error
+  mutating func withNextSpan<Result: ~Copyable, Failure>(
+    _ body: (inout InputSpan<Element>) async throws(Failure) -> Result
+  ) async throws(EitherError<DrainFailure, Failure>) -> Result
 }
 
-public protocol AsyncBufferedWriter<Element, Failure>: ~Copyable, ~Escapable {
+public protocol AsyncFill<Element, Failure>: ~Copyable, ~Escapable {
   associatedtype Element: ~Copyable
-  associatedtype Failure: Error
-  mutating func next() async throws(Failure) yields (inout OutputSpan<Element>)
+  associatedtype FillFailure: Error
+  mutating func intoNextSpan<Result: ~Copyable, Failure>(
+    _ body: (inout OutputSpan<Element>) async throws(Failure) -> Result
+  ) async throws(EitherError<FillFailure, Failure>) -> Result
 }
 ```
 
@@ -385,41 +436,43 @@ not run yet, so no buffer is shared with the kernel. Cancelling can resume the
 waiting continuation immediately and simply drop the interest. On a completion
 backend the kernel may be reading into or writing from the caller's buffer for
 as long as the task is suspended, so the operation cannot just be abandoned. The
-operation scheduler has to submit a real kernel cancellation and keep the buffer alive
-until the kernel confirms the operation completed or was cancelled. Some
+operation scheduler has to submit a real kernel cancellation and keep the buffer
+alive until the kernel confirms the operation completed or was cancelled. Some
 backends cannot cancel an in-flight operation at all, so they just have to wait
 until the operation completes.
 
-Intuitively one wants to fold the operation scheduler into the executor, so the object that
-runs a task's jobs also waits for its I/O, resulting in no extra threads, no
-hops, no priority inversion. Many executors already own everything an operation scheduler
-needs, whereas a standalone operation scheduler has to duplicate all of that and coordinate
-across a thread boundary for every completion. That makes combining the two the
-right *default* for maximum performance. But the combination should be optional,
-not required, because plenty of programs want the two roles apart. A test harness
-might swap in an in-memory operation scheduler to make I/O deterministic while its tasks
-keep running on the ordinary executor. A server might route its socket I/O
-through a single shared `io_uring` operation scheduler for batched submission without
-handing that operation scheduler the whole process's scheduling. So this vision proposes to
-treat the operation scheduler and the executor as separate roles that *may* be combined for
-maximum performance, rather than one thing that is always both.
+Intuitively one wants to fold the operation scheduler into the executor, so the
+object that runs a task's jobs also waits for its I/O, resulting in no extra
+threads, no hops, no priority inversion. Many executors already own everything
+an operation scheduler needs, whereas a standalone operation scheduler has to
+duplicate all of that and coordinate across a thread boundary for every
+completion. That makes combining the two the right *default* for maximum
+performance. But the combination should be optional, not required, because many
+programs want the two roles apart. A test harness might swap in an in-memory
+operation scheduler to make I/O deterministic while its tasks keep running on
+the ordinary executor. A server might route its socket I/O through a single
+shared `io_uring` operation scheduler for batched submission without handing
+that operation scheduler the whole process's scheduling. So this vision proposes
+to treat the operation scheduler and the executor as separate roles that *may*
+be combined for maximum performance, rather than one thing that is always both.
 
 The next sections introduce the different pieces to produce the overall story
 for asynchronous I/O in Swift Concurrency.
 
 ### The operation scheduler protocol
 
-An operation scheduler owns the *identity and control* of in-flight operations. It is
-deliberately *not* an executor and never runs jobs, since that's the executor's
-role. Every operation an operation scheduler services shares one common lifecycle:
+An operation scheduler owns the *identity and control* of in-flight operations.
+It is deliberately *not* an executor and never runs jobs, since that's the
+executor's role. Every operation an operation scheduler services shares one
+common lifecycle:
 
 > **Submit, then complete or cancel, then deliver a typed result**, with
 > priority carried throughout.
 
 Cancelling an operation and escalating its priority apply to every operation
 regardless of what it reads or writes, so they form a small, resource-agnostic
-baseline: given a value that identifies one in-flight operation, an operation scheduler can
-make a best-effort attempt to cancel it or raise its priority.
+baseline: given a value that identifies one in-flight operation, an operation
+scheduler can make a best-effort attempt to cancel it or raise its priority.
 
 ```swift
 public protocol OperationScheduler: AnyObject {
@@ -438,14 +491,14 @@ public struct OperationRegistration: Sendable, Hashable {
 
 ### Resource-specific operation scheduler protocols
 
-A resource family such as files, sockets, clocks, or processes is a protocol that
-*refines* `OperationScheduler` and adds that family's operations as concretely-typed
-`submit` methods. Each takes a `Continuation` carrying that operation's result
-and error type, and returns an `OperationRegistration` synchronously so the
-caller can wire up cancellation and escalation. Refining `OperationScheduler` per resource
-makes this model extensible, as packages or platforms can define their own
-resource-specific operation scheduler protocol that concrete operation schedulers
-can conform to.
+A resource family such as files, sockets, clocks, or processes is a protocol
+that *refines* `OperationScheduler` and adds that family's operations as
+concretely-typed `submit` methods. Each takes a `Continuation` carrying that
+operation's result and error type, and returns an `OperationRegistration`
+synchronously so the caller can wire up cancellation and escalation. Refining
+`OperationScheduler` per resource makes this model extensible, as packages or
+platforms can define their own resource-specific operation scheduler protocol
+that concrete operation schedulers can conform to.
 
 ```swift
 public protocol FileOperationScheduler: OperationScheduler {
@@ -465,13 +518,14 @@ public protocol FileOperationScheduler: OperationScheduler {
 }
 ```
 
-The standard library is expected to ship resource-specific operation scheduler protocols
-for the common resources: a `FileOperationScheduler`, socket and listener operation schedulers, a
-pipe operation scheduler, a clock operation scheduler, and a process operation scheduler, each refining
-`OperationScheduler` with that family's `submit` methods. Because a resource family is
-just a protocol refining `OperationScheduler`, a package or a platform can add a new kind
-of I/O by defining its own refinement and vending an operation scheduler that conforms to
-it, without any change to the core primitives:
+The standard library is expected to ship resource-specific operation scheduler
+protocols for the common resources: a `FileOperationScheduler`, socket and
+listener operation schedulers, a pipe operation scheduler, a clock operation
+scheduler, and a process operation scheduler, each refining `OperationScheduler`
+with that family's `submit` methods. Because a resource family is just a
+protocol refining `OperationScheduler`, a package or a platform can add a new
+kind of I/O by defining its own refinement and vending an operation scheduler
+that conforms to it, without any change to the core primitives:
 
 ```swift
 // A package that drives a bespoke device defines its own resource protocol.
@@ -486,20 +540,15 @@ public protocol CustomDeviceOperationScheduler: OperationScheduler {
 
 ### Stable buffer pointers
 
-As noted above, in a completion-based backend, when a read or write is submitted,
-the operation scheduler hands the kernel a pointer into the caller's buffer, and the kernel
-writes into that buffer directly at some point between submission and
-completion, while the task is suspended. The pointer has to stay valid, and the
-storage behind it has to stay in place, for the whole in-flight window rather
-than only for the duration of the `submitRead` call.
-
-The `OutputRawSpan` the caller passes owns that storage. The high-level type
-borrows it `inout` for the entire `async` operation, so the borrow spans the
-suspension and nothing else can move, mutate, or free the storage while the
-operation is in flight. The operation scheduler projects a stable pointer out of the span at
-submission and holds it until it resumes the continuation:
+As noted above, in a completion-based backend, when a read or write is
+submitted, the operation scheduler hands the kernel a pointer into the caller's
+buffer, and the kernel writes into that buffer directly at some point between
+submission and completion, while the task is suspended. The pointer has to stay
+valid, and the storage behind it has to stay in place, for the whole in-flight
+window rather than only for the duration of the `submitRead` call.
 
 ```swift
+// pseudo-code
 func submitRead(
   _ continuation: consuming Continuation<Int, IOError>,
   handle: PlatformHandle,
@@ -515,12 +564,12 @@ func submitRead(
 }
 ```
 
-The high-level `read` is what keeps that pointer valid. Its `buffer` parameter
-is `inout`, so the borrow of the caller's storage lasts for the whole `async`
-call, and it hands that same `buffer` to `submitRead` before suspending in
+The high-level `read` keeps that pointer valid. Its `buffer` parameter is
+`inout`, so the borrow of the caller's storage lasts for the whole `async` call,
+and it hands that same `buffer` to `submitRead` before suspending in
 `awaiter.wait()`. Because the borrow outlives the suspension, the storage the
-operation scheduler's pointer refers to cannot move or be freed until the continuation
-resumes and `read` returns:
+operation scheduler's pointer refers to cannot move or be freed until the
+continuation resumes and `read` returns:
 
 ```swift
 mutating func read(into buffer: inout OutputRawSpan) async throws(IOError) -> Int {
@@ -539,25 +588,27 @@ mutating func read(into buffer: inout OutputRawSpan) async throws(IOError) -> In
 
 ### Discovering an operation scheduler
 
-How a resource finds the operation scheduler that will service it is a scoped choice.
-Operation schedulers form a stack of preferences pushed for a dynamic scope, much like a
-task executor preference, so different parts of a program can run their I/O on
-different operation schedulers, e.g. one task on an `epoll` operation scheduler and another on
-`io_uring`, independently of which executor either runs on. They are
-*preferences* rather than requirements: a pushed operation scheduler that cannot service a
-resource is passed over and resolution continues outward.
+How a resource finds the operation scheduler that will service it is a scoped
+choice. Operation schedulers form a stack of preferences pushed for a dynamic
+scope, much like a task executor preference, so different parts of a program can
+run their I/O on different operation schedulers, e.g. one task on an `epoll`
+operation scheduler and another on `io_uring`, independently of which executor
+either runs on. They are *preferences* rather than requirements: a pushed
+operation scheduler that cannot service a resource is passed over and resolution
+continues outward.
 
 An operation resolves its operation scheduler by walking, in order:
 
-1. The pushed operation scheduler stack, from the innermost scope outward, taking the first
-   operation scheduler that services the operation's resource.
-2. The current executor, when it is itself an operation scheduler for that resource, first
-   the active serial executor and then the task executor preference.
+1. The pushed operation scheduler stack, from the innermost scope outward,
+   taking the first operation scheduler that services the operation's resource.
+2. The current executor, when it is itself an operation scheduler for that
+   resource, first the active serial executor and then the task executor
+   preference.
 3. The default operation scheduler.
 
-An explicitly pushed operation scheduler therefore always wins over the executor a task
-happens to be running on, so pushing one is enough to redirect a scope's I/O
-without also having to change how its jobs are scheduled.
+An explicitly pushed operation scheduler therefore always wins over the executor
+a task happens to be running on, so pushing one is enough to redirect a scope's
+I/O without also having to change where its jobs are executed.
 
 ```swift
 // `withOperationScheduler` pushes an operation scheduler as a preference for the dynamic extent of its body
@@ -570,8 +621,9 @@ try await withOperationScheduler(IOUringOperationScheduler()) {
 }
 ```
 
-A resource resolves its operation scheduler once, at creation, and stores it to ensure all
-later operations are submitted to the same operation scheduler it was created on.
+A resource resolves its operation scheduler once, at creation, and stores it to
+ensure all later operations are submitted to the same operation scheduler it was
+created on.
 
 ```swift
 public struct AsyncFile: ~Copyable, Sendable {
@@ -621,9 +673,9 @@ public struct AsyncFile: ~Copyable, Sendable {
 
 #### Overriding the default operation scheduler
 
-Scoped preferences pick an operation scheduler for part of a program. However, a program can
-also replace the process-wide default. Defaults are installed before any task
-runs by pointing a typealias at a factory:
+Scoped preferences pick an operation scheduler for part of a program. However, a
+program can also replace the process-wide default. Defaults are installed before
+any task runs by pointing a typealias at a factory:
 
 ```swift
 struct MyOperationSchedulerFactory: OperationSchedulerFactory {
@@ -634,17 +686,17 @@ struct MyOperationSchedulerFactory: OperationSchedulerFactory {
 typealias DefaultOperationSchedulerFactory = MyOperationSchedulerFactory
 ```
 
-Replacing the default operation scheduler means taking responsibility for the resources it
-must service: if it does not support a resource some dependency reaches, and
-nothing else in scope does either, that operation traps.
+Replacing the default operation scheduler means taking responsibility for the
+resources it must service: if it does not support a resource some dependency
+reaches, and nothing else in scope does either, that operation traps.
 
 ### Solving submission races
 
-The resource-specific operation scheduler protocols take continuations that they resume
-once an operation completes. Today continuations in Swift are created using
-`await withContinuation { ... }` which couples the creation and awaiting of the
-continuation in one method. The closure for the `withContinuation` method is
-synchronous, which forces the setup of cancellation and priority escalation
+The resource-specific operation scheduler protocols take continuations that they
+resume once an operation completes. Today continuations in Swift are created
+using `await withContinuation { ... }` which couples the creation and awaiting
+of the continuation in one method. The closure for the `withContinuation` method
+is synchronous, which forces the setup of cancellation and priority escalation
 handlers to happen *before* the continuation is created. This leads to various
 race conditions such as cancellation happening before the continuation was
 created. 
@@ -654,7 +706,7 @@ created.
 // the registration is "trapped" there. The cancellation handler has to wrap the
 // await from the outside, where the registration is not yet in scope.
 try await withTaskCancellationHandler {
-  try await withCheckedContinuation { continuation in
+  try await withContinuation { continuation in
     let registration = operationScheduler.submitRead(continuation, handle: handle, into: &buffer)
     // `registration` cannot escape this closure.
   }
@@ -708,9 +760,9 @@ try await withContinuation(of: Int.self, throwing: IOError.self) { continuation,
 Today continuations offer multiple `resume` methods. Each of them puts the value
 into the buffer of the suspended task and then enqueues the task to run on the
 executor again. While this works, it means that every resumption always leads to
-an additional enqueue. For a combined operation scheduler and executor this is unnecessary
-since they would rather donate their current thread to resume the task
-synchronously.
+an additional enqueue. For a combined operation scheduler and executor this is
+unnecessary since they would rather donate their current thread to resume the
+task synchronously.
 
 Continuations therefore gain a synchronous, thread-donating resume alongside the
 existing one:
@@ -730,9 +782,9 @@ extension Continuation {
 }
 ```
 
-A combined operation scheduler and executor drains completions on its own thread and, because
-that thread is an executor thread, resumes each task inline instead of
-enqueuing:
+A combined operation scheduler and executor drains completions on its own thread
+and, because that thread is an executor thread, resumes each task inline instead
+of enqueuing:
 
 ```swift
 while running {
@@ -746,31 +798,33 @@ while running {
 }
 ```
 
-A standalone operation scheduler, whose thread is not an executor thread, calls the
-ordinary `resume(with:)` and takes the one hop back onto the task's executor.
+A standalone operation scheduler, whose thread is not an executor thread, calls
+the ordinary `resume(with:)` and takes the one hop back onto the task's
+executor.
 
 ### High-level types
 
-Application and library authors are not expected to touch operation schedulers or
-continuations directly. As the `AsyncFile` above shows, each resource gets an
+Application and library authors are not expected to touch operation schedulers
+or continuations directly. As the `AsyncFile` above shows, each resource gets an
 ergonomic high-level type, a `TCPConnection`, a `UDPSocket`, and so on, that
 hides the discovery, storage, and continuation-and-handler dance behind ordinary
 `async` methods, so a read is just `file.read(into:)`.
 
 These high-level types conform to the streaming protocols, which lets them
 compose. The `file.pipe(into: &connection)` shown earlier works because both
-sides are an `AsyncReader`/`AsyncWriter`:
+sides are an `AsyncProducer`/`AsyncConsumer`:
 
 ```swift
-extension AsyncFile: AsyncReader, AsyncWriter {} // Element == UInt8, Failure == IOError
-extension AsyncTCPConnection: AsyncReader, AsyncWriter {}
+extension AsyncFile: AsyncProducer, AsyncConsumer {} // Element == UInt8, Failure == IOError
+extension AsyncTCPConnection: AsyncProducer, AsyncConsumer {}
 ```
 
 ### Clocks and deadlines
 
-Not every resource is handle-backed. A clock is the smallest operation scheduler: it
-services a single `sleep`, and because a sleep has no handle to store, it
-resolves its operation scheduler per call through the same discovery chain.
+Not every resource is handle-backed. A clock is the smallest operation
+scheduler: it services a single `sleep`, and because a sleep has no handle to
+store, it resolves its operation scheduler per call through the same discovery
+chain.
 
 ```swift
 public protocol ContinuousClockOperationScheduler: OperationScheduler {
@@ -784,8 +838,8 @@ public protocol ContinuousClockOperationScheduler: OperationScheduler {
 
 Clocks are not only used for sleeps but also for deadlines. A deadline is a
 point in time where a certain scope needs to be cancelled. This can be
-implemented by a clock operation scheduler with a fire callback at that instant, and when
-the callback fires it cancels the scope.
+implemented by a clock operation scheduler with a fire callback at that instant,
+and when the callback fires it cancels the scope.
 
 ```swift
 public protocol ContinuousClockOperationScheduler: OperationScheduler {
@@ -830,6 +884,28 @@ public func withDeadline<Return>(
 ```
 
 ## Future directions
+
+### A one-shot coroutine for the stream-owned forms
+
+The stream-owned streaming protocols take a closure because the lending has to be
+scoped. The nicer spelling is a one-shot coroutine that yields the span and
+resumes once the caller is done with it:
+
+```swift
+mutating func next() async throws(Failure) yields (inout InputSpan<Element>)
+```
+
+`yielding` accessors ([SE-0474][SE-0474]) cover computed properties and
+subscripts, yield-once *functions* are only a future direction of that proposal,
+and the coroutine support that exists cannot throw, cannot be `async`, and
+cannot take or yield `inout` arguments.
+
+The semantics accessors settled on also constrain what the second half of such a
+coroutine may do: it always runs, it cannot throw, and it does not know whether
+the caller threw, so it can only fix up in-memory state. Flushing a full writer
+buffer does not, since a flush can fail. A coroutine-based writer would
+therefore have to flush in the first half of the *next* call rather than after
+the yield.
 
 ### A linked-operation DSL
 
@@ -905,10 +981,11 @@ contexts"](#prohibiting-synchronous-io-in-asynchronous-contexts).
 The most direct design makes the executor itself the thing that waits for I/O,
 so there is only ever one component and never a hop. We rejected making that the
 *only* model. Welding eventing to the executor forecloses the configurations
-that motivate the split: an in-memory operation scheduler swapped in for deterministic
-tests, a single shared `io_uring` operation scheduler serving several executors, or a bare
-I/O service that has no business scheduling arbitrary jobs. The operation scheduler is
-therefore a separate capability that *may* be combined with an executor.
+that motivate the split: an in-memory operation scheduler swapped in for
+deterministic tests, a single shared `io_uring` operation scheduler serving
+several executors, or a bare I/O service that has no business scheduling
+arbitrary jobs. The operation scheduler is therefore a separate capability that
+*may* be combined with an executor.
 
 ### A single data-driven operation type
 
@@ -925,10 +1002,11 @@ implements.
 
 Rather than separate `File` and `AsyncFile`, a single type could carry both
 surfaces and pick per call. We rejected it since an asynchronous resource has to
-hold the operation scheduler it was pinned to at creation while a synchronous one holds
-nothing, so a unified type would carry an optional operation scheduler and an ill-defined
-answer for what a synchronous read does on an asynchronously-opened handle.
-Separate types give each exactly the state it needs.
+hold the operation scheduler it was pinned to at creation while a synchronous
+one holds nothing, so a unified type would carry an optional operation scheduler
+and an ill-defined answer for what a synchronous read does on an
+asynchronously-opened handle. Separate types give each exactly the state it
+needs.
 
 ### Unadorned names for the synchronous surface
 
@@ -941,17 +1019,17 @@ convention keeps the surfaces predictable across the standard library.
 
 ### Asynchronous operation scheduler methods
 
-The operation scheduler's `submit` methods could themselves be `async` and simply return
-the result. We kept them continuation-taking and synchronous instead to avoid
-having each operation scheduler implement the continuation, cancellation and priority
-escalation setup. More importantly, it makes further optimizations possible,
-such as a child-task-free `select` and fused linked operations.
+The operation scheduler's `submit` methods could themselves be `async` and
+simply return the result. We kept them continuation-taking and synchronous
+instead to avoid having each operation scheduler implement the continuation,
+cancellation and priority escalation setup. More importantly, it makes further
+optimizations possible, such as a child-task-free `select` and fused linked
+operations.
 
 ## Prior art
 
 Other ecosystems have solved asynchronous I/O in ways worth contrasting, since
-the choices in this vision are based on lessons from what those models get right
-and where they fragment.
+the choices in this vision are based on lessons from what those models.
 
 ### Go
 
@@ -972,8 +1050,8 @@ leaves the reactor concrete and per-runtime: there is no `Reactor` trait, only
 `Future::poll` and the `Waker` vtable of `clone` / `wake` / `wake_by_ref` /
 `drop`. A leaf future stashes the `Waker` and returns `Pending`. The runtime's
 own reactor such as `mio`, tokio's I/O driver, or `async-io`, later calls `wake`
-to have the task polled again. That interface is runtime-agnostic, but minimal in
-two consequential ways: the `wake` carries no result, so the value must be
+to have the task polled again. That interface is runtime-agnostic, but minimal
+in two consequential ways: the `wake` carries no result, so the value must be
 recovered by re-polling, and its only option is to *reschedule*. On top of that
 the ecosystem fragments along concrete runtimes for two further reasons:
 
@@ -997,7 +1075,7 @@ and cancellation carried by a `stop_token`. This is the same split this vision's
 [split continuation](#solving-submission-races) makes, where you create the
 suspension object first, begin it, then let a typed result flow back. The three
 completion channels line up with typed success, typed `IOError`, and
-`cancelled`.
+`IOError.cancelled`.
 
 ### .NET
 
@@ -1030,3 +1108,6 @@ keeps a synchronous, blocking API and moves the asynchrony underneath it,
 whereas Swift already has `async`/`await` and structured concurrency. So this
 vision expresses I/O as first-class asynchronous operations with typed results
 and cancellation rather than hiding them behind a blocking facade.
+
+[SE-0474]: https://github.com/swiftlang/swift-evolution/blob/main/proposals/0474-yielding-accessors.md
+[SE-0516]: https://github.com/swiftlang/swift-evolution/blob/main/proposals/0516-borrowing-sequence.md

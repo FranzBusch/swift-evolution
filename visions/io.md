@@ -703,7 +703,7 @@ methods, and they trade off reliability against cost:
 While a new function color is the most correct, it has such wide-reaching impact
 on the language that the runtime trap is the best answer right now, trading
 off language complexity against a small runtime cost. The check itself can be
-generated with a new `@blocking` macro that marks an operation that may block
+generated with a new `@blocking` attribute that marks an operation that may block
 and rewrites its body to ask the runtime first:
 
 ```swift
@@ -786,7 +786,7 @@ so a program cannot choose or specialize how its I/O is serviced.
 
 Rust splits the world into an executor, which is an async runtime, and a
 reactor, which is an `epoll` or `io_uring` wrapper, connected by futures and
-wakers. Crucially, Rust standardi`es only the *waker* side and leaves the
+wakers. Crucially, Rust standardizes only the *waker* side and leaves the
 reactor concrete and per-runtime: there is no `Reactor` trait, only
 `Future::poll` and the `Waker` vtable of `clone` / `wake` / `wake_by_ref` /
 `drop`. A leaf future stashes the `Waker` and returns `Pending`. The runtime's

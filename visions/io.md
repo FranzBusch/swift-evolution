@@ -34,13 +34,12 @@
   * [Discovering an operation scheduler](#discovering-an-operation-scheduler)
     * [Overriding the default operation scheduler](#overriding-the-default-operation-scheduler)
   * [Solving submission races](#solving-submission-races)
-  * [Child-task-free multi-await](#child-task-free-multi-await)
   * [Combining the operation scheduler and the executor](#combining-the-operation-scheduler-and-the-executor)
 * [Coexisting with blocking code](#coexisting-with-blocking-code)
 * [Alternatives considered](#alternatives-considered)
   * [Eventing as a property of the executor](#eventing-as-a-property-of-the-executor)
   * [A single data-driven operation type](#a-single-data-driven-operation-type)
-  * [Asynchronous operation scheduler methods](#asynchronous-operation-scheduler-methods)
+  * [Synchronous submit methods](#synchronous-submit-methods)
 * [Prior art](#prior-art)
   * [Go](#go)
   * [Rust](#rust)
@@ -411,77 +410,64 @@ for asynchronous I/O integration in Swift Concurrency.
 
 ### The operation scheduler protocol
 
-An operation scheduler owns the *identity and control* of in-flight operations.
-It is deliberately *not* an executor and never runs jobs, since that's the
-executor's role. Every operation an operation scheduler services shares one
-common lifecycle:
+An operation scheduler services the operations of one or more resource families.
+It is deliberately *not* an executor and never runs any jobs, since that's the
+executor's responsibility. Every operation an operation scheduler provides
+shares one common lifecycle:
 
-> **Submit, then complete or cancel, then deliver a typed result**, with
-> priority carried throughout.
+> **Start, then complete or cancel, then deliver a typed result**, with priority
+> carried throughout.
 
-Cancelling an operation and escalating its priority apply to every operation
-regardless of what it reads or writes, so they form a small, resource-agnostic
-baseline. In addition to this lifecycle, many operation schedulers need a small
-amount of private state per in-flight operation, at a stable address. Some
-examples are an `aiocb` for POSIX asynchronous I/O or an `OVERLAPPED` for
-Windows overlapped I/O. The exact size differs per backend. The operation
-scheduler therefore declares the state as an associated type, and the caller
-allocates it on the task's stack for the duration of the operation.
+This is expressed by operation being a `async` methods that returns once the
+operation has completed or has been cancelled. Many operation schedulers also
+need a small amount of private state per in-flight operation at a stable
+address. Some examples are an `aiocb` for POSIX asynchronous I/O or an
+`OVERLAPPED` for Windows overlapped I/O. That state lives in the frame of the
+operation's `async` method.
+
+When the calling task is cancelled, the operation scheduler cancels the
+in-flight operation, and when the task's priority is escalated, the operation
+scheduler re-prioritizes the operation if the platform supports it.
+
+Since the public API of an operation is just an `async` method all of this must
+be handled by the implementations of concrete operation schedulers. However, we
+need a new protocol root similar to the `Executor` protocol that specific
+operation schedulers are derived from:
 
 ```swift
-public protocol OperationScheduler: AnyObject {
-  // Per-operation state for this scheduler.
-  associatedtype OperationState: ~Copyable
-
-  func cancel(_ registration: OperationRegistration)
-  func escalatePriority(
-    of registration: OperationRegistration,
-    to newPriority: TaskPriority
-  )
-}
-
-// An opaque and stable identity for one in-flight operation.
-public struct OperationRegistration: Sendable, Hashable { ... }
+public protocol OperationScheduler: AnyObject, Sendable {}
 ```
 
 ### Resource-specific operation scheduler protocols
 
 A resource family such as clocks, files, sockets, or processes is modeled
 through a protocol that *refines* `OperationScheduler` and adds that family's
-operations as concretely-typed `submit` methods. Each takes a `Continuation`
-carrying that operation's result and error type, the scheduler's per-operation
-state, and returns an `OperationRegistration` synchronously so the caller can
-wire up cancellation and escalation.
+operations as concretely-typed `async` methods, each returning that operation's
+result and throwing a typed `IOError`.
 
-Returning from a `submit` method does not mean the operation is live in the
+Suspending in one of these methods does not mean the operation is live in the
 kernel. An operation scheduler is allowed to record the operation and defer the
-syscall that starts it, which allows a backend to batch several operations into
-a single syscall: an `io_uring` backend writes submission queue entries and
-delays `io_uring_enter`, and a `kqueue` backend accumulates a changelist and
-applies it in one `kevent`. The only guarantee `submit` makes is that the
-operation has
-been accepted and that the returned registration identifies it.
+syscall that starts it, which allows a backend to batch the operations of many
+suspended tasks into a single submission. An `io_uring` backend writes
+submission queue entries and delays `io_uring_enter`, or a `kqueue` backend
+accumulates a changelist and applies it in one `kevent`.
 
 ```swift
 public protocol FileOperationScheduler: OperationScheduler {
   associatedtype FileHandle
 
-  func submitOpen(
-    _ continuation: consuming Continuation<FileHandle, IOError>,
-    state: inout OutputSpan<OperationState>,
+  func open(
     at path: FilePath,
     options: FileOpenOptions
-  ) -> OperationRegistration
+  ) async throws(IOError) -> FileHandle
 
-  func submitRead(
-    _ continuation: consuming Continuation<Int, IOError>,
-    state: inout OutputSpan<OperationState>,
-    handle: FileHandle,
+  func read(
+    file: borrowing FileHandle,
     into buffer: inout OutputRawSpan,
-    offset: Int64?
-  ) -> OperationRegistration
+    at offset: Int64?
+  ) async throws(IOError) -> Int
 
-  // submitWrite, submitClose, submitSync, ...
+  // write, close, sync, ...
 }
 ```
 
@@ -497,12 +483,10 @@ the core primitives:
 ```swift
 // A package that drives a bespoke device defines its own resource protocol.
 public protocol CustomDeviceOperationScheduler: OperationScheduler {
-  func submitDeviceRead(
-    _ continuation: consuming Continuation<Int, IOError>,
-    state: inout OutputSpan<OperationState>,
-    device: CustomDevice,
+  func read(
+    device: borrowing CustomDevice,
     into buffer: inout OutputRawSpan
-  ) -> OperationRegistration
+  ) async throws(IOError) -> Int
 }
 ```
 
@@ -554,28 +538,36 @@ typealias DefaultOperationSchedulerFactory = MyOperationSchedulerFactory
 
 ### Solving submission races
 
-The resource-specific operation scheduler protocols take continuations that they
-resume once an operation completes. Today continuations in Swift are created
-using `await withContinuation { ... }` which couples the creation and awaiting
-of the continuation in one method. The closure for the `withContinuation` method
-is synchronous, which forces the setup of cancellation and priority escalation
-handlers to happen *before* the continuation is created. This leads to various
-race conditions such as cancellation happening before the continuation was
-created.
+Inside its `async` methods, an operation scheduler has to start the operation,
+suspend the calling task, and resume it with the result once the operation
+completes. Continuations are the primitive for that. Today continuations in
+Swift are created using `await withContinuation { ... }` which couples the
+creation and awaiting of the continuation in one method. The closure for the
+`withContinuation` method is synchronous, which forces the setup of cancellation
+and priority escalation handlers to happen *before* the continuation is created.
+This leads to various race conditions such as cancellation happening before the
+operation was started.
 
 ```swift
-// The continuation is created and awaited inside the same synchronous closure, so
-// the registration is "trapped" there. The cancellation handler has to wrap the
-// await from the outside, where the registration is not yet in scope.
-try await withTaskCancellationHandler {
-  try await withContinuation { continuation in
-    let registration = operationScheduler.submitRead(continuation, handle: handle, into: &buffer)
-    // `registration` cannot escape this closure.
+func read(
+  file handle: borrowing FileHandle,
+  into buffer: inout OutputRawSpan,
+  at offset: Int64?
+) async throws(IOError) -> Int {
+  // The continuation is created and awaited inside the same synchronous closure,
+  // so the identity of the started operation is "trapped" there. The
+  // cancellation handler has to wrap the await from the outside, where that
+  // identity is not yet in scope.
+  try await withTaskCancellationHandler {
+    try await withContinuation { continuation in
+      let id = self.startRead(continuation, handle: handle, into: &buffer, offset: offset)
+      // `id` cannot escape this closure.
+    }
+  } onCancel: {
+    // We cannot cancel the in-flight operation: `id` is not visible here, and the
+    // operation may even complete before this handler is installed or this
+    // handler is called before the operation is started.
   }
-} onCancel: {
-  // We cannot cancel the in-flight operation: `registration` is not visible here,
-  // and the operation may even complete before this handler is installed or this
-  // handler is called before the operation is submitted.
 }
 ```
 
@@ -585,7 +577,7 @@ of the continuation, which resolves the races above.
 
 ```swift
 // The split primitive hands the body two halves: a `Continuation` resume half to
-// give to the operation scheduler, and a `ContinuationAwaiter` the task keeps and awaits.
+// give to the operation, and a `ContinuationAwaiter` the task keeps and awaits.
 public nonisolated(nonsending) func withContinuation<Success: ~Copyable, Failure: Error>(
   of: Success.Type = Success.self,
   throwing: Failure.Type,
@@ -596,43 +588,30 @@ public nonisolated(nonsending) func withContinuation<Success: ~Copyable, Failure
 ) async throws(Failure) -> Success
 ```
 
-Because the body is `async`, the operation can be submitted and its registration
-kept in scope. The cancellation and escalation handlers are then installed on
-the await itself, so they can refer to that registration. Passing them to the
-await also lets the runtime publish both handlers and suspend the task in a
-single update to the task's state, rather than one update per handler followed
-by a third to suspend:
+Because the body is `async`, the operation can be started and its identity kept
+in scope. The cancellation and escalation handlers are then installed on the
+await itself, so they can refer to that identity. Passing them to the await also
+lets the runtime publish both handlers and suspend the task in a single update to
+the task's state, rather than one update per handler followed by a third to
+suspend:
 
 ```swift
-try await withContinuation(of: Int.self, throwing: IOError.self) { continuation, awaiter in
-  // The continuation is handed to the operation scheduler before the task
-  // suspends, so the registration it returns is in scope for the handlers.
-  let registration = operationScheduler.submitRead(
-    continuation, handle: handle, into: &buffer, offset: offset
-  )
+func read(
+  file handle: borrowing FileHandle,
+  into buffer: inout OutputRawSpan,
+  at offset: Int64?
+) async throws(IOError) -> Int {
+  try await withContinuation(of: Int.self, throwing: IOError.self) { continuation, awaiter in
+    // The operation is started before the task suspends, so the identity the
+    // backend returns for it is in scope for the handlers.
+    let id = self.startRead(continuation, handle: handle, into: &buffer, offset: offset)
 
-  // Publishes both handlers and suspends in one step.
-  return try await awaiter.wait(
-    onCancel: { operationScheduler.cancel(registration) },
-    onEscalate: { newPriority in
-      operationScheduler.escalatePriority(of: registration, to: newPriority)
-    }
-  )
-}
-```
-
-### Child-task-free multi-await
-
-Awaiting several operations at once requires a task group with one child task
-per pending operation. Because the split continuation already separates
-submission from awaiting, the runtime could instead offer a first-wins `select`
-over a variadic set of awaiters that returns whichever completes first.
-
-```swift
-// One-shot and heterogeneous: the first to complete wins.
-switch await select(timer.awaiter, connection.readAwaiter) {
-case .first: break                    // the timer fired
-case .second(let bytes): use(bytes)   // the read completed
+    // Publishes both handlers and suspends in one step.
+    return try await awaiter.wait(
+      onCancel: { self.cancel(id) },
+      onEscalate: { newPriority in self.escalatePriority(of: id, to: newPriority) }
+    )
+  }
 }
 ```
 
@@ -743,7 +722,7 @@ arbitrary jobs. The operation scheduler is therefore a separate capability that
 ### A single data-driven operation type
 
 The resource protocols expose each operation as a concretely typed method, for
-example `submitRead` and `submitWrite`. The alternative is a single data-driven
+example `read` and `write`. The alternative is a single data-driven
 `submit(operation)` core, the shape of an `io_uring` SQE or a `uv_req_t`, where
 the operation kind and its arguments are packed into one value. We chose the
 typed methods: they buy static result typing, discovery by protocol conformance,
@@ -751,21 +730,70 @@ extensibility, and no dispatch on an operation kind. The cost is a larger
 protocol surface, since a new operation is a new method every conforming backend
 implements.
 
-### Asynchronous operation scheduler methods
+### Synchronous submit methods
 
-The operation scheduler's `submit` methods could themselves be `async` and
-simply return the result. An `async` method would also remove the need for a
-separate per-operation state primitive, since the state could be a local
-variable in the operation scheduler's own frame, sized exactly for that
-backend.
+The operation schedulers could instead expose synchronous `submit` methods. Each
+would take the continuation to resume once the operation completes and the
+per-operation state, which the caller allocates, and return an
+`OperationRegistration` that identifies the operation for cancellation and
+escalation:
 
-We kept them continuation-taking and synchronous for two reasons. An `async`
-method cannot be started without being awaited, so a task can only ever have one
-operation in flight per suspension, which makes [child-task-free
-multi-await](#child-task-free-multi-await) impossible. Second, it keeps the
-suspension,
-the cancellation handler and the escalation handler in one place rather than
-requiring every backend to reimplement them.
+```swift
+public protocol OperationScheduler: AnyObject {
+  // Per-operation state for this scheduler.
+  associatedtype OperationState: ~Copyable
+
+  func cancel(_ registration: OperationRegistration)
+  func escalatePriority(
+    of registration: OperationRegistration,
+    to newPriority: TaskPriority
+  )
+}
+
+public protocol FileOperationScheduler: OperationScheduler {
+  associatedtype FileHandle
+
+  func submitRead(
+    _ continuation: consuming Continuation<Int, IOError>,
+    state: inout OutputSpan<OperationState>,
+    handle: FileHandle,
+    into buffer: inout OutputRawSpan,
+    offset: Int64?
+  ) -> OperationRegistration
+}
+```
+
+This design has two appeals. Starting an operation does not require awaiting it,
+so a task could start several operations and wait for whichever completes first
+without a child task per operation. For example a first-wins `select` over their
+awaiters:
+
+```swift
+// One-shot and heterogeneous: the first to complete wins.
+switch await select(timer.awaiter, connection.readAwaiter) {
+case .first: break                    // the timer fired
+case .second(let bytes): use(bytes)   // the read completed
+}
+```
+
+It also keeps the suspension and the cancellation and escalation handlers in one
+place, the caller, rather than requiring every backend to implement them.
+
+We rejected it because it results in unsafe APIs. A `submit` method returns
+while its operation is still in flight, so the operation outlives access to
+buffers and state. However, the caller's access to `buffer` ends when
+`submitRead` returns, yet a readiness backend writes into the buffer from
+another thread once the descriptor becomes ready, and a completion backend lets
+the kernel write into it until the operation completes. We cannot express the
+lifetime requirements on the parameters of synchronous methods which means there
+is an implicit non-enforced contract for caller's of these synchronous
+methods.The caller has to promise to keep memory alive and in place until the
+continuation resumes. That's too unsafe for an API that we expect to live in Swift's
+core libraries.
+
+With `async` methods an operation cannot outlive the call that started it. The
+caller's access to its buffers lasts until the method returns and the compiler
+enforces the lifetimes.
 
 ## Prior art
 
